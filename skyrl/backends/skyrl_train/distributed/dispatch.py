@@ -149,6 +149,24 @@ class MeshDispatch(Dispatch):
             mini_batch = data[start:end]
             mb_size = end - start
 
+            # ⚠️ SKIP EMPTY MINI-BATCHES INSTEAD OF DYING ON THEM.
+            # compute_prompt_mini_batch_boundaries always emits exactly
+            # train_batch_size // mini_batch_size boundaries, whether or not that
+            # much data actually arrived. When a generator returns a SHORT batch —
+            # e.g. some rollouts crashed and their rows are absent — the trailing
+            # boundaries are degenerate (start == end). mb_size is then 0, so
+            # pad_size = (-0) % dp_size = 0, chunk_size = 0 // dp_size = 0, and
+            # `range(0, n, 0)` raises "range() arg 3 must not be zero".
+            #
+            # That turned a recoverable partial batch into a hard crash at every
+            # step: rollouts completed, the forward pass died, the job retried, and
+            # no gradient step ever ran (observed 2026-08-18, 24 prompts arriving
+            # where 32 were expected). An empty mini-batch contributes no rows, and
+            # callers consume `all_chunk_refs` by iteration and concatenate the
+            # outputs, so omitting it is equivalent to it having produced nothing.
+            if mb_size <= 0:
+                continue
+
             # Pad to make divisible by dp_size. Will only be non-zero for step-wise training.
             pad_size = (-mb_size) % dp_size
             if pad_size > 0:
