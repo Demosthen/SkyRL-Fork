@@ -164,11 +164,18 @@ class MeshDispatch(Dispatch):
             # where 32 were expected). An empty mini-batch contributes no rows, and
             # callers consume `all_chunk_refs` by iteration and concatenate the
             # outputs, so omitting it is equivalent to it having produced nothing.
-            if mb_size <= 0:
+            # ⚠️ MEASURE THE SLICE, NOT THE BOUNDARY. `mb_size = end - start` is what
+            # the boundary ASKED for; len(mini_batch) is what the data actually held.
+            # When the batch is shorter than the boundaries assume, a boundary can be
+            # positive while its slice is empty — the first version of this guard
+            # tested mb_size, let exactly that case through, and the crash just moved
+            # a few lines down.
+            actual = len(mini_batch)
+            if actual <= 0:
                 continue
 
             # Pad to make divisible by dp_size. Will only be non-zero for step-wise training.
-            pad_size = (-mb_size) % dp_size
+            pad_size = (-actual) % dp_size
             if pad_size > 0:
                 mini_batch = pad_training_input_batch(mini_batch, pad_size)
 
@@ -176,6 +183,8 @@ class MeshDispatch(Dispatch):
             assert (
                 mini_batch_size % dp_size == 0
             ), f"mini_batch_size % dp_size != 0, got {mini_batch_size} and {dp_size}"
+            if mini_batch_size == 0:
+                continue
             chunk_size = mini_batch_size // dp_size
             chunks = mini_batch.chunk(chunk_size)
             all_chunk_refs.append([ray.put(chunk) for chunk in chunks])
