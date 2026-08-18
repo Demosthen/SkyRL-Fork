@@ -48,6 +48,23 @@ class Tracking:
             import wandb
 
             wandb.init(project=project_name, name=experiment_name, config=get_config_as_dict(config), tags=tags)
+            # ⚠️ PLOT AGAINST global_step, NOT wandb's implicit counter.
+            # wandb.log(step=N) enforces a monotonically increasing N and SILENTLY
+            # DROPS anything <= the highest already logged. Training restarts —
+            # which a chained SLURM run does by design — reset global_step while
+            # that watermark stays put, so every step of a resumed run below the
+            # watermark vanishes with only a WARNING in the log.
+            #
+            # Measured 2026-08-18: four crashed attempts pushed the watermark to 5,
+            # after which the run that finally worked logged steps 1, 2 and 3 and
+            # wandb discarded all three ("Tried to log to step 1 that is less than
+            # the current step 5"). The metrics existed, the training was real, and
+            # the dashboard showed one stale point.
+            #
+            # Declaring global_step as the step metric makes it an ordinary data
+            # column: a restart plots at x=1 again instead of being rejected.
+            wandb.define_metric("global_step")
+            wandb.define_metric("*", step_metric="global_step")
             self.logger: Any = wandb
         elif backend == "mlflow":
             self.logger = _MlflowLoggingAdapter(project_name, experiment_name, config)
@@ -78,7 +95,10 @@ class Tracking:
 
     def log(self, data, step, commit=False):
         if self.backend == "wandb":
-            self.logger.log(data=data, step=step, commit=commit)
+            # Pass global_step as DATA, not as wandb's `step=`. See define_metric
+            # in __init__: `step=` is the monotonic counter that drops replayed
+            # steps, whereas a data column simply overwrites at the same x.
+            self.logger.log(data={**data, "global_step": step}, commit=commit)
         else:
             self.logger.log(data=data, step=step)
 
@@ -169,7 +189,10 @@ class Tracking:
         new_table = wandb.Table(columns=columns, data=list(self._sample_tables[key].data))
         for row in samples:
             new_table.add_data(*row)
-        self.logger.log({key: new_table}, step=step)
+        # Same reason as Tracking.log: `step=` re-arms wandb's monotonic counter,
+        # which would both drop this table on a replayed step AND push the
+        # watermark back up, defeating the global_step step-metric above.
+        self.logger.log({key: new_table, "global_step": step})
         self._sample_tables[key] = new_table
 
     def __del__(self):
