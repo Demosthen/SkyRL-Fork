@@ -363,6 +363,19 @@ class RayPPOTrainer:
                         if self._vllm_metrics_scraper is not None:
                             self._vllm_metrics_scraper.pause()
 
+                        # A generator may return MORE rows than `uids` has entries,
+                        # or fewer. `prepare_generator_input` builds exactly
+                        # n_samples_per_prompt uids per prompt, but a generator that
+                        # attaches auxiliary conversations as extra training samples,
+                        # or that drops a prompt whose rollouts all failed, breaks that
+                        # 1:1 correspondence. `_expanded_uids` is the generator's own
+                        # per-row uid list; when present it is authoritative.
+                        #
+                        # Getting this wrong is silent: `uids` feeds the advantage
+                        # grouping and the mini-batch boundaries, so a length mismatch
+                        # misgroups rows rather than raising.
+                        uids = generator_output.pop("_expanded_uids", uids)
+
                         if self.cfg.generator.step_wise_trajectories:
                             # NOTE: We use instance_ids from `trajectory_ids` here instead of re-using `uids`
                             # this is because in step-wise training, len(uids) != len(generator_output["response_ids"])

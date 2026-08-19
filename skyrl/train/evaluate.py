@@ -91,6 +91,10 @@ async def evaluate(
         if vllm_metrics_scraper is not None:
             vllm_metrics_scraper.pause()
         eval_generate_time += time.monotonic() - gen_start
+        # See the note in trainer.train(): when the generator returns a per-row uid
+        # list it is authoritative, because its row count need not match
+        # prepare_generator_input's prompts x n_samples.
+        uids = generator_output.pop("_expanded_uids", uids)
         validate_generator_output(len(generator_input["prompts"]), generator_output)
         generator_outputs.append(generator_output)
         concat_all_envs.extend(generator_input["env_classes"])
