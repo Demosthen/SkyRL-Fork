@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -283,13 +283,47 @@ def convert_prompts_responses_to_batch_tensors(
     )
 
 
-def compute_prompt_boundaries(uids: List[str]) -> List[Tuple[int, int]]:
+def split_auxiliary_rows(uids: List[str], auxiliary_uids: Optional[Set[str]] = None) -> int:
+    """Return the index where the trailing auxiliary block begins.
+
+    ``auxiliary_uids`` names uid groups that are NOT prompts — rows a generator
+    appends alongside the prompt rollouts and wants trained, but which have no
+    prompt of their own and must not be counted against ``train_batch_size``.
+
+    They are REQUIRED to form one contiguous block at the END of the batch. That
+    is not an arbitrary restriction: every boundary this module produces is a
+    contiguous ``(start, end)`` slice, so auxiliary rows anywhere else could not
+    be attached to a mini-batch without splitting it.
+
+    Returns ``len(uids)`` when there are none.
+    """
+    if not auxiliary_uids:
+        return len(uids)
+    split = len(uids)
+    while split > 0 and uids[split - 1] in auxiliary_uids:
+        split -= 1
+    # Anything auxiliary before the block means the caller ordered the batch
+    # wrongly. Fail here rather than silently miscounting prompts.
+    stray = [i for i in range(split) if uids[i] in auxiliary_uids]
+    assert not stray, (
+        f"auxiliary uids must form a single contiguous block at the END of the "
+        f"batch; found auxiliary rows at {stray[:8]} before the block starting "
+        f"at {split}. Full uids: {uids}"
+    )
+    return split
+
+
+def compute_prompt_boundaries(uids: List[str], auxiliary_uids: Optional[Set[str]] = None) -> List[Tuple[int, int]]:
     """Compute per-prompt ``(start, end)`` slices from a flat ``uids`` list.
 
     Args:
         uids: List of uids, representing which prompt each sequence belongs to. Consecutive
             equal entries belong to the same prompt (same assumption as
             ``compute_prompt_mini_batch_boundaries``).
+        auxiliary_uids: uid groups that are not prompts. See ``split_auxiliary_rows``.
+            Each auxiliary group becomes its own trailing boundary, so consumers
+            that normalise per prompt (e.g. the ``prompt_mean`` loss reduction)
+            treat it as one group rather than folding it into the last prompt.
 
     Returns:
         List of (start, end) indices, one per prompt, in order. Works for both step-wise
@@ -310,6 +344,10 @@ def compute_prompt_boundaries(uids: List[str]) -> List[Tuple[int, int]]:
             start = i
     if uids:
         boundaries.append((start, len(uids)))
+    # Validate placement even though the grouping above already handles auxiliary
+    # rows correctly — a misplaced auxiliary row is a caller bug either way, and
+    # this is the cheapest place to say so.
+    split_auxiliary_rows(uids, auxiliary_uids)
     return boundaries
 
 
@@ -319,6 +357,7 @@ def compute_prompt_mini_batch_boundaries(
     train_batch_size: int,
     is_stepwise: bool,
     n_samples_per_prompt: int,
+    auxiliary_uids: Optional[Set[str]] = None,
 ) -> List[Tuple[int, int]]:
     """Compute mini-batch ``(start, end)`` slices from a flat ``uids`` list.
 
@@ -329,6 +368,9 @@ def compute_prompt_mini_batch_boundaries(
         train_batch_size: Number of prompts in a training batch. For sanity check.
         is_stepwise: Whether the training is step-wise. For sanity check.
         n_samples_per_prompt: how many samples per prompt. For sanity check.
+        auxiliary_uids: uid groups that are NOT prompts — see ``split_auxiliary_rows``.
+            Excluded from every prompt count and sanity check, then appended to the
+            final mini-batch so they still train.
     Returns:
         List of (start, end) indices of the mini-batches. The length of the list is the number of
         mini-batches, guaranteed to be `train_batch_size // mini_batch_size` regardless of whether
@@ -354,18 +396,26 @@ def compute_prompt_mini_batch_boundaries(
     prompt_end_indices = [4, 6, 9, 11]
     boundaries = [(0, 6), (6, 11)]
     """
+    # Auxiliary rows are NOT prompts. Split them off before any prompt counting:
+    # they carry their own uid(s), so leaving them in makes `len(seen_uids)`
+    # exceed `train_batch_size` and the sanity check below fires on a batch that
+    # is perfectly well-formed.
+    aux_start = split_auxiliary_rows(uids, auxiliary_uids)
+    prompt_uids = uids[:aux_start]
+    assert prompt_uids, "batch contains auxiliary rows but no prompt rows"
+
     # First compute the end indices of each prompt.
     prompt_end_indices: List[int] = []
     seen_uids: set[str] = set()
-    seen_uids.add(uids[0])
-    for i in range(1, len(uids)):
-        if uids[i] != uids[i - 1]:
+    seen_uids.add(prompt_uids[0])
+    for i in range(1, len(prompt_uids)):
+        if prompt_uids[i] != prompt_uids[i - 1]:
             assert (
-                uids[i] not in seen_uids
-            ), f"uid {uids[i]!r} appears in non-contiguous positions at index {i}. Full uids: {uids}"
-            seen_uids.add(uids[i])
+                prompt_uids[i] not in seen_uids
+            ), f"uid {prompt_uids[i]!r} appears in non-contiguous positions at index {i}. Full uids: {uids}"
+            seen_uids.add(prompt_uids[i])
             prompt_end_indices.append(i)
-    prompt_end_indices.append(len(uids))
+    prompt_end_indices.append(len(prompt_uids))
 
     # seen_uids should equal to the number of prompts and equal to `train_batch_size`
     num_prompts = len(prompt_end_indices)
@@ -383,10 +433,22 @@ def compute_prompt_mini_batch_boundaries(
     assert len(boundaries) == train_batch_size // mini_batch_size
 
     # Assert that the mini-batch boundaries are uniform for non-step-wise training.
+    # Checked against the PROMPT rows only — the auxiliary tail is appended after.
     if not is_stepwise:
         expected_num_seq_in_mini_batch = n_samples_per_prompt * mini_batch_size
         for i, (start, end) in enumerate(boundaries):
             assert start == i * expected_num_seq_in_mini_batch
             assert end - start == expected_num_seq_in_mini_batch
+
+    # ── Attach the auxiliary tail ────────────────────────────────────────────
+    # ⚠️ IT GOES ENTIRELY INTO THE LAST MINI-BATCH, and it cannot be spread.
+    # A mini-batch is one contiguous (start, end) slice, so rows sitting after
+    # every prompt can only join the slice that ends the batch. Consequence
+    # worth knowing: auxiliary rows contribute to ONE optimizer step per epoch
+    # pass, not to every step. Their total gradient contribution is unchanged
+    # (that is set by their loss weights), but it is concentrated.
+    if aux_start < len(uids):
+        start_seq, _ = boundaries[-1]
+        boundaries[-1] = (start_seq, len(uids))
 
     return boundaries

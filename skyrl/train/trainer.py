@@ -4,7 +4,7 @@ import shutil
 from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import ray
@@ -376,6 +376,16 @@ class RayPPOTrainer:
                         # misgroups rows rather than raising.
                         uids = generator_output.pop("_expanded_uids", uids)
 
+                        # Which of those uid groups are NOT prompts. A generator
+                        # that appends auxiliary conversations gives them their
+                        # own uid, which would otherwise be counted as an extra
+                        # prompt and trip the `len(seen_uids) == train_batch_size`
+                        # check in compute_prompt_mini_batch_boundaries — on a
+                        # batch that is perfectly well-formed.
+                        auxiliary_uids = generator_output.pop("_auxiliary_uids", None)
+                        if auxiliary_uids is not None:
+                            auxiliary_uids = set(auxiliary_uids)
+
                         # Optional per-row TRAJECTORY key, aligned with `uids`.
                         #
                         # A generator that emits one row per agent TURN gives every
@@ -443,7 +453,9 @@ class RayPPOTrainer:
 
                         # 3. Convert GeneratorOutput to TrainingInputBatch
                         with Timer("convert_to_training_input", self.all_timings):
-                            training_input: TrainingInputBatch = self.convert_to_training_input(generator_output, uids)
+                            training_input: TrainingInputBatch = self.convert_to_training_input(
+                                generator_output, uids, auxiliary_uids
+                            )
                             # Must be set here, not later: `compute_advantages_and_returns`
                             # below is the consumer, so anything attached after that
                             # call arrives too late and the estimator silently falls
@@ -886,7 +898,12 @@ class RayPPOTrainer:
         self.dispatch.init_weight_sync_state(self.inference_engine_client)
         logger.info("Initialized weight sync state for policy model and inference engines.")
 
-    def convert_to_training_input(self, generator_output: GeneratorOutput, uids: List[str]) -> TrainingInputBatch:
+    def convert_to_training_input(
+        self,
+        generator_output: GeneratorOutput,
+        uids: List[str],
+        auxiliary_uids: Optional[Set[str]] = None,
+    ) -> TrainingInputBatch:
         """Converts lists to a padded batch of tensors for training
 
         Args:
@@ -979,14 +996,24 @@ class RayPPOTrainer:
         n_samples_per_prompt = self.cfg.generator.n_samples_per_prompt
         is_stepwise = self.cfg.generator.step_wise_trajectories
         training_input.metadata["policy_mini_batch_boundaries"] = compute_prompt_mini_batch_boundaries(
-            uids, self.cfg.trainer.policy_mini_batch_size, train_batch_size, is_stepwise, n_samples_per_prompt
+            uids,
+            self.cfg.trainer.policy_mini_batch_size,
+            train_batch_size,
+            is_stepwise,
+            n_samples_per_prompt,
+            auxiliary_uids,
         )
         # Per-prompt boundaries (used by the `prompt_mean` loss reduction). Policy-only,
         # since advantage normalization only applies to the policy.
-        training_input.metadata["policy_prompt_boundaries"] = compute_prompt_boundaries(uids)
+        training_input.metadata["policy_prompt_boundaries"] = compute_prompt_boundaries(uids, auxiliary_uids)
         if self.cfg.trainer.critic.model.path is not None:
             training_input.metadata["critic_mini_batch_boundaries"] = compute_prompt_mini_batch_boundaries(
-                uids, self.cfg.trainer.critic_mini_batch_size, train_batch_size, is_stepwise, n_samples_per_prompt
+                uids,
+                self.cfg.trainer.critic_mini_batch_size,
+                train_batch_size,
+                is_stepwise,
+                n_samples_per_prompt,
+                auxiliary_uids,
             )
 
         # 5. Record metadata and metrics.
