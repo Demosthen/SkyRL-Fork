@@ -823,6 +823,11 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         "UV_PYTHON",
         "UV_OFFLINE",
         "PYTORCH_CUDA_ALLOC_CONF",
+        # Consumed by FSDPStrategy.prepare's optional LR step-down. The scheduler
+        # is built inside the worker actors, so these have to reach them; a
+        # driver-only value silently yields the configured scheduler instead.
+        "LR_STEPDOWN_FACTOR",
+        "LR_STEPDOWN_AT_OPTSTEP",
         # Debug/trace knobs — forwarded so they reach the worker actors, not just the driver.
         "CUDA_LAUNCH_BLOCKING",
         "PYTHONFAULTHANDLER",

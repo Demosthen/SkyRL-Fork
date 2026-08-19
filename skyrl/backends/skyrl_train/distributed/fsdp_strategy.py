@@ -306,6 +306,33 @@ class FSDPStrategy(DistributedStrategy):
                 num_warmup_steps=optim_config.num_warmup_steps,
                 num_training_steps=self.total_training_steps,
             )
+
+            # Optional two-level LR step-down, replacing the configured scheduler.
+            #
+            # Constant-LR RL runs on long-horizon agent tasks tend to peak early and
+            # then regress as the policy over-optimizes (per-step KL climbing from
+            # ~0 to ~0.24 over the following few steps). A cosine decay is the wrong
+            # shape for that: it throttles LR *during* the useful early window. This
+            # holds full LR through that window and then steps down, slowing drift
+            # while still allowing refinement.
+            #
+            # The threshold is in OPTIMIZER steps, not global steps, because the
+            # scheduler is stepped once per mini-batch in `optimizer_step` above.
+            #
+            # Off unless LR_STEPDOWN_FACTOR is set, so every other run keeps the
+            # scheduler it configured. Read from the environment rather than config
+            # because it is a per-run experiment knob, not part of the algorithm.
+            stepdown_factor = os.environ.get("LR_STEPDOWN_FACTOR")
+            if stepdown_factor:
+                stepdown_at = int(os.environ.get("LR_STEPDOWN_AT_OPTSTEP", "55"))
+                factor = float(stepdown_factor)
+                logger.info(
+                    f"LR step-down enabled: x{factor} from optimizer step {stepdown_at} "
+                    f"(overrides scheduler '{optim_config.scheduler}')"
+                )
+                lr_scheduler = optim.lr_scheduler.LambdaLR(
+                    new_optimizer, lambda step: 1.0 if step < stepdown_at else factor
+                )
         else:
             new_optimizer = None
             lr_scheduler = None
