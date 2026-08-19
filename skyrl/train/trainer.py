@@ -376,6 +376,18 @@ class RayPPOTrainer:
                         # misgroups rows rather than raising.
                         uids = generator_output.pop("_expanded_uids", uids)
 
+                        # Optional per-row TRAJECTORY key, aligned with `uids`.
+                        #
+                        # A generator that emits one row per agent TURN gives every
+                        # row of a trajectory the same uid, so an outcome estimator
+                        # that groups by uid treats turns as independent samples: the
+                        # baseline becomes turn-count weighted, the leave-one-out
+                        # factor N/(N-1) is computed over rows rather than
+                        # trajectories, and a row's own trajectory contaminates its
+                        # baseline. Estimators that want to collapse turns back into
+                        # trajectories read this; the rest ignore it.
+                        expanded_traj_ids = generator_output.pop("_expanded_traj_ids", None)
+
                         if self.cfg.generator.step_wise_trajectories:
                             # NOTE: We use instance_ids from `trajectory_ids` here instead of re-using `uids`
                             # this is because in step-wise training, len(uids) != len(generator_output["response_ids"])
@@ -432,6 +444,12 @@ class RayPPOTrainer:
                         # 3. Convert GeneratorOutput to TrainingInputBatch
                         with Timer("convert_to_training_input", self.all_timings):
                             training_input: TrainingInputBatch = self.convert_to_training_input(generator_output, uids)
+                            # Must be set here, not later: `compute_advantages_and_returns`
+                            # below is the consumer, so anything attached after that
+                            # call arrives too late and the estimator silently falls
+                            # back to per-row grouping.
+                            if expanded_traj_ids is not None:
+                                training_input.metadata["expanded_traj_ids"] = expanded_traj_ids
 
                         # 4. Inference and calculate values, log probs, rewards, kl divergence
                         with Timer("fwd_logprobs_values_reward", self.all_timings):
@@ -450,6 +468,7 @@ class RayPPOTrainer:
                                 training_input.pop(key)
                             training_input.metadata.pop("uids")
                             training_input.metadata.pop("is_last_step", None)
+                            training_input.metadata.pop("expanded_traj_ids", None)
 
                         if self.cfg.trainer.dump_data_batch:
                             # dump data to file
@@ -1202,6 +1221,9 @@ class RayPPOTrainer:
                 gamma=self.cfg.trainer.algorithm.gamma,
                 lambd=self.cfg.trainer.algorithm.lambd,
                 grpo_norm_by_std=self.cfg.trainer.algorithm.grpo_norm_by_std,
+                # Reaches the estimator through **kwargs. Estimators that collapse
+                # turn-rows into trajectories read it; the rest ignore it.
+                _expanded_traj_ids=data.metadata.get("expanded_traj_ids"),
             )
         data["returns"] = returns
         data["advantages"] = advantages
