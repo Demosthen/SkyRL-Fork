@@ -138,7 +138,18 @@ def logprobs_from_logits(
         last_dim = logits.shape[-1]
         logits = logits.reshape(-1, last_dim)
         labels = labels.reshape(-1)
-        output = logprobs_from_logits_flash_attn(logits, labels, inplace_backward=inplace_backward)
+        try:
+            output = logprobs_from_logits_flash_attn(logits, labels, inplace_backward=inplace_backward)
+        except AttributeError:
+            # Triton >= 3.x probes unconditionally for `PyCUtensorMap` (an H100 TMA
+            # feature) at first kernel launch. On an A100 whose driver does not
+            # expose the symbol the probe raises
+            #     AttributeError: module 'cuda_utils' has no attribute 'PyCUtensorMap'
+            # which kills the ref-model forward during KL computation, right after
+            # the first generation step. Fall back to the pure-PyTorch path; the
+            # cost is negligible because generation, not this forward, is the
+            # bottleneck.
+            output = logprobs_from_logits_v2(logits, labels)
         output = output.view(*batch_dim)
     else:
         output = logprobs_from_logits_v2(logits, labels)
