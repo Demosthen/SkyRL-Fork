@@ -169,6 +169,39 @@ class FSDPStrategy(DistributedStrategy):
             else:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.max_norm)
 
+        # Skip the update when the gradient is EXACTLY zero, not just non-finite.
+        #
+        # 0.0 is finite, so the check below lets it through and `optimizer.step()`
+        # runs anyway — which is not a no-op under AdamW. The moment buffers still
+        # hold the previous step's direction and only decay (m *= beta1 per step),
+        # so k zero-grad steps apply roughly sum(beta1^k) normal-magnitude updates,
+        # all in one direction, with no corrective signal.
+        #
+        # Observed (SWE-smith GRPO, 2026-08): the inference engine died mid-rollout,
+        # every agent request came back malformed, the agent auto-submitted an empty
+        # patch, and the trainer saw a perfectly healthy-looking batch in which every
+        # reward was 0. Equal rewards make RLOO advantages exactly zero, hence
+        # grad_norm 0. At 16 optimizer steps per batch that was ~7.3 units of pure
+        # momentum extrapolation, and the run then checkpointed the result.
+        #
+        # Skipping is strictly safer than stepping: a genuinely zero gradient carries
+        # no information, so there is nothing to lose. The scheduler is deliberately
+        # not advanced either, so a degenerate batch cannot consume schedule.
+        if grad_norm is not None and grad_norm == 0:
+            if torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+                logger.warning(
+                    f"rank {rank} grad_norm is exactly 0 — skipping optimizer step "
+                    "(degenerate batch: all rewards equal?)"
+                )
+            else:
+                logger.warning(
+                    "grad_norm is exactly 0 — skipping optimizer step "
+                    "(degenerate batch: all rewards equal?)"
+                )
+            optimizer.zero_grad()
+            return grad_norm
+
         # Skip update if gradient norm is not finite
         if grad_norm is not None and not torch.isfinite(grad_norm):
             if torch.distributed.is_initialized():
