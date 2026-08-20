@@ -417,24 +417,66 @@ def compute_prompt_mini_batch_boundaries(
             prompt_end_indices.append(i)
     prompt_end_indices.append(len(prompt_uids))
 
-    # seen_uids should equal to the number of prompts and equal to `train_batch_size`
+    # ⚠️ FEWER PROMPTS THAN `train_batch_size` IS NORMAL, NOT A BUG.
+    #
+    # A generator returns what its rollouts produced. When every rollout of one
+    # prompt fails — timeout, crashed agent, empty trajectory — that prompt has
+    # no rows and no uid, and the batch legitimately carries fewer than
+    # `train_batch_size` groups. This used to assert, which turned a batch that
+    # was 29/32 useful into a dead run: observed at step 6 of a SWE-smith GRPO
+    # run with `Valid trajectories: 174/192`, failing identically on every retry
+    # until the launcher's no-progress guard released the node.
+    #
+    # More prompts than expected IS still a bug — it means uids were miscounted
+    # or auxiliary rows went untagged — so that direction still asserts.
     num_prompts = len(prompt_end_indices)
-    assert num_prompts == train_batch_size and len(seen_uids) == train_batch_size
+    assert num_prompts == len(seen_uids), (
+        f"prompt count {num_prompts} disagrees with distinct uid count "
+        f"{len(seen_uids)}; uids are not grouped contiguously. Full uids: {uids}"
+    )
+    assert num_prompts <= train_batch_size, (
+        f"{num_prompts} prompt groups exceeds train_batch_size {train_batch_size}. "
+        f"Extra uid groups that are not prompts must be tagged via "
+        f"`auxiliary_uids` — see split_auxiliary_rows."
+    )
     assert train_batch_size % mini_batch_size == 0
+    num_mini_batches = train_batch_size // mini_batch_size
+    if num_prompts < train_batch_size:
+        logger.warning(
+            f"batch is SHORT: {num_prompts} prompt groups, expected "
+            f"{train_batch_size}. {train_batch_size - num_prompts} prompt(s) lost "
+            f"every rollout. Spreading the survivors over {num_mini_batches} "
+            f"mini-batches; RLOO groups stay intact but the batch is smaller."
+        )
 
     # Compute boundaries.
+    #
+    # Prompts are spread over the SAME number of mini-batches whether or not the
+    # batch is short — `train_batch_size // mini_batch_size` is a contract the
+    # dispatch layer relies on. With a short batch the split is as even as
+    # possible rather than fixed-size, so no mini-batch takes the whole
+    # shortfall. A prompt is never split across mini-batches: that would break
+    # the RLOO group it forms.
     boundaries: List[Tuple[int, int]] = []
     start_seq = 0
-    for i in range(0, num_prompts, mini_batch_size):
-        end_prompt_idx = i + mini_batch_size - 1  # i + mini_batch_size is next mini-batch's first prompt's end index
-        end_seq = prompt_end_indices[end_prompt_idx]
+    for m in range(num_mini_batches):
+        # prompts [lo, hi) of this mini-batch, distributing the remainder
+        lo = (m * num_prompts) // num_mini_batches
+        hi = ((m + 1) * num_prompts) // num_mini_batches
+        if hi <= lo:
+            # More mini-batches than surviving prompts: emit an empty slice.
+            # The dispatch layer already skips empty mini-batches.
+            boundaries.append((start_seq, start_seq))
+            continue
+        end_seq = prompt_end_indices[hi - 1]
         boundaries.append((start_seq, end_seq))
         start_seq = end_seq
-    assert len(boundaries) == train_batch_size // mini_batch_size
+    assert len(boundaries) == num_mini_batches
 
     # Assert that the mini-batch boundaries are uniform for non-step-wise training.
     # Checked against the PROMPT rows only — the auxiliary tail is appended after.
-    if not is_stepwise:
+    # Only meaningful for a FULL batch: a short one is deliberately uneven.
+    if not is_stepwise and num_prompts == train_batch_size:
         expected_num_seq_in_mini_batch = n_samples_per_prompt * mini_batch_size
         for i, (start, end) in enumerate(boundaries):
             assert start == i * expected_num_seq_in_mini_batch
