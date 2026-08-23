@@ -475,8 +475,17 @@ def compute_prompt_mini_batch_boundaries(
 
     # Assert that the mini-batch boundaries are uniform for non-step-wise training.
     # Checked against the PROMPT rows only — the auxiliary tail is appended after.
-    # Only meaningful for a FULL batch: a short one is deliberately uneven.
-    if not is_stepwise and num_prompts == train_batch_size:
+    #
+    # ⚠️ "FULL" MEANS FULL IN ROWS, NOT IN PROMPTS. Guarding on
+    # `num_prompts == train_batch_size` is not enough and was the bug in the
+    # first version of this: a batch can have all 32 prompts and still be ragged,
+    # because a prompt that loses SOME of its rollouts still contributes a uid.
+    # `Valid trajectories: 191/192 (1 dropped)` is exactly that — 32 prompts, one
+    # of them with 5 rows instead of 6 — and it fired this assertion on the very
+    # first step of a run. Losing one rollout out of 192 is routine; losing every
+    # rollout of a prompt is not, which is why this case matters more.
+    full_batch = len(prompt_uids) == train_batch_size * n_samples_per_prompt
+    if not is_stepwise and full_batch:
         expected_num_seq_in_mini_batch = n_samples_per_prompt * mini_batch_size
         for i, (start, end) in enumerate(boundaries):
             assert start == i * expected_num_seq_in_mini_batch
