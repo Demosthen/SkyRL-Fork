@@ -290,10 +290,11 @@ def split_auxiliary_rows(uids: List[str], auxiliary_uids: Optional[Set[str]] = N
     appends alongside the prompt rollouts and wants trained, but which have no
     prompt of their own and must not be counted against ``train_batch_size``.
 
-    They are REQUIRED to form one contiguous block at the END of the batch. That
-    is not an arbitrary restriction: every boundary this module produces is a
-    contiguous ``(start, end)`` slice, so auxiliary rows anywhere else could not
-    be attached to a mini-batch without splitting it.
+    This helper is for the TRAILING-BLOCK layout, and asserts it. The boundary
+    functions below no longer require it: they attach each auxiliary row to the
+    prompt group before it, which for a trailing block is the last prompt (so
+    the old behaviour is unchanged) and also allows rows interleaved after their
+    own parent's group.
 
     Returns ``len(uids)`` when there are none.
     """
@@ -331,23 +332,22 @@ def compute_prompt_boundaries(uids: List[str], auxiliary_uids: Optional[Set[str]
 
     Example: uids = ["p0", "p0", "p1", "p1", "p1"] -> [(0, 2), (2, 5)]
     """
+    aux = auxiliary_uids or set()
     boundaries: List[Tuple[int, int]] = []
     seen_uids: set[str] = set()
     start = 0
     for i in range(1, len(uids)):
         if uids[i] != uids[i - 1]:
+            # Auxiliary groups may recur: interleaved rows (see
+            # compute_prompt_mini_batch_boundaries) give one boundary per run.
             assert (
-                uids[i] not in seen_uids
+                uids[i] in aux or uids[i] not in seen_uids
             ), f"uid {uids[i]!r} appears in non-contiguous positions at index {i}. Full uids: {uids}"
             seen_uids.add(uids[i - 1])
             boundaries.append((start, i))
             start = i
     if uids:
         boundaries.append((start, len(uids)))
-    # Validate placement even though the grouping above already handles auxiliary
-    # rows correctly — a misplaced auxiliary row is a caller bug either way, and
-    # this is the cheapest place to say so.
-    split_auxiliary_rows(uids, auxiliary_uids)
     return boundaries
 
 
@@ -369,8 +369,10 @@ def compute_prompt_mini_batch_boundaries(
         is_stepwise: Whether the training is step-wise. For sanity check.
         n_samples_per_prompt: how many samples per prompt. For sanity check.
         auxiliary_uids: uid groups that are NOT prompts — see ``split_auxiliary_rows``.
-            Excluded from every prompt count and sanity check, then appended to the
-            final mini-batch so they still train.
+            Excluded from every prompt count and sanity check. Each auxiliary row
+            trains in the mini-batch of the PROMPT GROUP BEFORE IT, so a trailing
+            block lands in the final mini-batch and rows placed after their own
+            prompt group train alongside it.
     Returns:
         List of (start, end) indices of the mini-batches. The length of the list is the number of
         mini-batches, guaranteed to be `train_batch_size // mini_batch_size` regardless of whether
@@ -396,26 +398,45 @@ def compute_prompt_mini_batch_boundaries(
     prompt_end_indices = [4, 6, 9, 11]
     boundaries = [(0, 6), (6, 11)]
     """
-    # Auxiliary rows are NOT prompts. Split them off before any prompt counting:
-    # they carry their own uid(s), so leaving them in makes `len(seen_uids)`
-    # exceed `train_batch_size` and the sanity check below fires on a batch that
-    # is perfectly well-formed.
-    aux_start = split_auxiliary_rows(uids, auxiliary_uids)
-    prompt_uids = uids[:aux_start]
-    assert prompt_uids, "batch contains auxiliary rows but no prompt rows"
+    # Auxiliary rows are NOT prompts. Keep them out of prompt counting: they
+    # carry their own uid(s), so counting them makes `len(seen_uids)` exceed
+    # `train_batch_size` and the sanity check below fires on a batch that is
+    # perfectly well-formed.
+    #
+    # ⭐ AN AUXILIARY ROW BELONGS TO THE PROMPT GROUP BEFORE IT. A prompt's slice
+    # runs from its first row to the next prompt's first row, so auxiliary rows
+    # sitting between two groups join the earlier one's mini-batch. With the
+    # auxiliary rows as one trailing block this is exactly the old behaviour
+    # (they join the last prompt, hence the last mini-batch). Placing them after
+    # their own parent's group instead spreads them over the mini-batches their
+    # parents train in. RLOO grouping is by uid, not position, so neither layout
+    # changes any advantage.
+    aux = auxiliary_uids or set()
+    is_aux = [u in aux for u in uids]
+    assert not all(is_aux), "batch contains auxiliary rows but no prompt rows"
+    assert not is_aux[0], (
+        "auxiliary rows must follow a prompt group (they train in the mini-batch of "
+        f"the group before them); the batch starts with one. Full uids: {uids}"
+    )
 
-    # First compute the end indices of each prompt.
-    prompt_end_indices: List[int] = []
+    # First row of each prompt, and how many PROMPT rows it has.
+    prompt_starts: List[int] = []
+    prompt_rows: List[int] = []
     seen_uids: set[str] = set()
-    seen_uids.add(prompt_uids[0])
-    for i in range(1, len(prompt_uids)):
-        if prompt_uids[i] != prompt_uids[i - 1]:
+    current = None
+    for i, u in enumerate(uids):
+        if is_aux[i]:
+            continue
+        if u != current:
             assert (
-                prompt_uids[i] not in seen_uids
-            ), f"uid {prompt_uids[i]!r} appears in non-contiguous positions at index {i}. Full uids: {uids}"
-            seen_uids.add(prompt_uids[i])
-            prompt_end_indices.append(i)
-    prompt_end_indices.append(len(prompt_uids))
+                u not in seen_uids
+            ), f"uid {u!r} appears in non-contiguous positions at index {i}. Full uids: {uids}"
+            seen_uids.add(u)
+            current = u
+            prompt_starts.append(i)
+            prompt_rows.append(0)
+        prompt_rows[-1] += 1
+    prompt_end_indices: List[int] = prompt_starts[1:] + [len(uids)]
 
     # ⚠️ FEWER PROMPTS THAN `train_batch_size` IS NORMAL, NOT A BUG.
     #
@@ -484,22 +505,20 @@ def compute_prompt_mini_batch_boundaries(
     # of them with 5 rows instead of 6 — and it fired this assertion on the very
     # first step of a run. Losing one rollout out of 192 is routine; losing every
     # rollout of a prompt is not, which is why this case matters more.
-    full_batch = len(prompt_uids) == train_batch_size * n_samples_per_prompt
+    #
+    # Counted in PROMPT rows: auxiliary rows ride along in whichever mini-batch
+    # holds their preceding prompt, so slice lengths legitimately vary.
+    full_batch = sum(prompt_rows) == train_batch_size * n_samples_per_prompt
     if not is_stepwise and full_batch:
         expected_num_seq_in_mini_batch = n_samples_per_prompt * mini_batch_size
-        for i, (start, end) in enumerate(boundaries):
-            assert start == i * expected_num_seq_in_mini_batch
-            assert end - start == expected_num_seq_in_mini_batch
+        for m in range(num_mini_batches):
+            lo = (m * num_prompts) // num_mini_batches
+            hi = ((m + 1) * num_prompts) // num_mini_batches
+            assert sum(prompt_rows[lo:hi]) == expected_num_seq_in_mini_batch
 
-    # ── Attach the auxiliary tail ────────────────────────────────────────────
-    # ⚠️ IT GOES ENTIRELY INTO THE LAST MINI-BATCH, and it cannot be spread.
-    # A mini-batch is one contiguous (start, end) slice, so rows sitting after
-    # every prompt can only join the slice that ends the batch. Consequence
-    # worth knowing: auxiliary rows contribute to ONE optimizer step per epoch
-    # pass, not to every step. Their total gradient contribution is unchanged
-    # (that is set by their loss weights), but it is concentrated.
-    if aux_start < len(uids):
-        start_seq, _ = boundaries[-1]
-        boundaries[-1] = (start_seq, len(uids))
-
+    # ⚠️ A TRAILING auxiliary block lands entirely in the LAST mini-batch (it
+    # follows the last prompt), so it contributes to one optimizer step per
+    # epoch, not to every step. Its total weight is unchanged, only
+    # concentrated. Place auxiliary rows after their own prompt group to spread
+    # them instead.
     return boundaries
