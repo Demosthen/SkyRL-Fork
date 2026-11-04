@@ -72,6 +72,9 @@ class Experience:
     info: Optional[dict]
     router_padding_mask: Optional[Bool[torch.Tensor, "batch seq_len"]] = None
     kl: Optional[Float[torch.Tensor, "batch response_len"]] = None
+    # Per-row KL weight (see ppo_utils.fixed_row_minibatch_corrections). None =
+    # plain mean over rows; present only when the batch has fixed-advantage rows.
+    kl_row_weight: Optional[Float[torch.Tensor, "batch"]] = None
     metadata: Optional[Dict[str, Any]] = None
     pixel_values: Optional[TensorList] = None
     image_grid_thw: Optional[TensorList] = None

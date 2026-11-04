@@ -175,6 +175,7 @@ class BaseBatchIterator:
             # Per-row sub-sequence lengths for sequence packing (None otherwise);
             # chunked per micro-batch by ``TensorBatch.chunk`` like any other field.
             sub_seq_lengths=batch.get("sub_seq_lengths"),
+            kl_row_weight=batch.get("kl_row_weight"),
         )
         return exp
 

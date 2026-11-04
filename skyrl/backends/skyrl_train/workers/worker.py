@@ -1074,7 +1074,13 @@ class PolicyWorkerBase(Worker):
                     loss_mask=loss_mask,
                     kl_estimator_type=self.cfg.algorithm.kl_estimator_type,
                 )
-                kl_loss = masked_mean(kl_loss, loss_mask, dim=-1).mean()
+                kl_per_row = masked_mean(kl_loss, loss_mask, dim=-1)
+                if experience.kl_row_weight is not None:
+                    # Mean over ORDINARY rows of the mini-batch (fixed-advantage
+                    # rows weigh 0); see ppo_utils.fixed_row_minibatch_corrections.
+                    kl_loss = (kl_per_row * experience.kl_row_weight.to(kl_per_row)).mean()
+                else:
+                    kl_loss = kl_per_row.mean()
             else:
                 kl_loss = torch.tensor(0.0)
             kl_loss_term = kl_loss * self.cfg.algorithm.kl_loss_coef

@@ -37,6 +37,8 @@ from skyrl.backends.skyrl_train.utils.off_policy_correction_utils import (
     off_policy_correction_enabled,
 )
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
+    apply_fixed_advantages,
+    fixed_row_minibatch_corrections,
     LOSSES_WITHOUT_OLD_LOGPROBS,
     AdaptiveKLController,
     FixedKLController,
@@ -398,6 +400,25 @@ class RayPPOTrainer:
                         # trajectories read this; the rest ignore it.
                         expanded_traj_ids = generator_output.pop("_expanded_traj_ids", None)
 
+                        # Row-aligned fixed advantages (None = estimator decides).
+                        # A generator that appends rows whose advantage must not
+                        # come from group-relative estimation — e.g. penalty rows
+                        # whose auxiliary group is uniform, so RLOO would give
+                        # exactly 0 — names the value here. Applied in
+                        # compute_advantages_and_returns, BEFORE batch norm.
+                        fixed_advantages = generator_output.pop("_fixed_advantages", None)
+                        if fixed_advantages is not None:
+                            assert len(fixed_advantages) == len(generator_output["response_ids"]), (
+                                f"_fixed_advantages has {len(fixed_advantages)} entries for "
+                                f"{len(generator_output['response_ids'])} rows"
+                            )
+                            assert self.cfg.trainer.algorithm.dynamic_sampling.type is None, (
+                                "_fixed_advantages is row-aligned; dynamic sampling filters rows"
+                            )
+                            assert not self.cfg.generator.step_wise_trajectories, (
+                                "_fixed_advantages is not supported with step-wise trajectories"
+                            )
+
                         if self.cfg.generator.step_wise_trajectories:
                             # NOTE: We use instance_ids from `trajectory_ids` here instead of re-using `uids`
                             # this is because in step-wise training, len(uids) != len(generator_output["response_ids"])
@@ -424,7 +445,21 @@ class RayPPOTrainer:
 
                         # 1.2 postprocess rewards (and merge step-wise turns if enabled)
                         with Timer("postprocess_generator_output", self.all_timings):
-                            generator_output, uids = self.postprocess_generator_output(generator_output, uids)
+                            if fixed_advantages is not None:
+                                # Reward metrics describe ROLLOUTS. Fixed-advantage rows carry
+                                # a placeholder reward and a uniform uid group, so they would
+                                # lower avg_raw_reward / pass@N. Metrics read only `rewards`.
+                                _keep = [i for i, v in enumerate(fixed_advantages) if v is None]
+                                generator_output, uids = self.postprocess_generator_output(
+                                    generator_output,
+                                    uids,
+                                    metrics_generator_output={
+                                        "rewards": [generator_output["rewards"][i] for i in _keep]
+                                    },
+                                    metrics_uids=[uids[i] for i in _keep],
+                                )
+                            else:
+                                generator_output, uids = self.postprocess_generator_output(generator_output, uids)
 
                         # 2.1 print example just for debugging
                         print_interval = self.cfg.trainer.print_example_interval
@@ -452,6 +487,8 @@ class RayPPOTrainer:
                                 )
 
                         # 3. Convert GeneratorOutput to TrainingInputBatch
+                        if fixed_advantages is not None:
+                            generator_output["_fixed_advantages_for_metrics"] = fixed_advantages
                         with Timer("convert_to_training_input", self.all_timings):
                             training_input: TrainingInputBatch = self.convert_to_training_input(
                                 generator_output, uids, auxiliary_uids
@@ -462,6 +499,9 @@ class RayPPOTrainer:
                             # back to per-row grouping.
                             if expanded_traj_ids is not None:
                                 training_input.metadata["expanded_traj_ids"] = expanded_traj_ids
+                            if fixed_advantages is not None:
+                                training_input.metadata["fixed_advantages"] = fixed_advantages
+                            generator_output.pop("_fixed_advantages_for_metrics", None)
 
                         # 4. Inference and calculate values, log probs, rewards, kl divergence
                         with Timer("fwd_logprobs_values_reward", self.all_timings):
@@ -1026,9 +1066,15 @@ class RayPPOTrainer:
                 "generate/batch_padded_seq_len": batch_padded_seq_len,
             }
         )
+        _fixed_meta = generator_output.get("_fixed_advantages_for_metrics")
+        _resp_for_len = (
+            [r for r, f in zip(response_ids, _fixed_meta) if f is None] or response_ids
+            if _fixed_meta is not None
+            else response_ids
+        )
         training_input.metadata["avg_response_length"] = sum(
-            len(sample_response_ids) for sample_response_ids in response_ids
-        ) / len(response_ids)
+            len(sample_response_ids) for sample_response_ids in _resp_for_len
+        ) / len(_resp_for_len)
 
         # 6. Pad the batch, only needed for step-wise training's `fwd_logprobs_values_reward()`.
         logger.info(f"Number of sequences before padding: {len(training_input['sequences'])}")
@@ -1252,6 +1298,12 @@ class RayPPOTrainer:
                 # turn-rows into trajectories read it; the rest ignore it.
                 _expanded_traj_ids=data.metadata.get("expanded_traj_ids"),
             )
+        fixed = data.metadata.get("fixed_advantages")
+        fixed_rows: List[int] = []
+        if fixed is not None:
+            advantages, returns, fixed_rows = apply_fixed_advantages(
+                advantages, returns, data["response_mask"], fixed
+            )
         data["returns"] = returns
         data["advantages"] = advantages
 
@@ -1262,6 +1314,12 @@ class RayPPOTrainer:
         return_sums = token_level_rewards.sum(dim=-1)[: num_samples - pad_size]
         if self.cfg.generator.step_wise_trajectories:
             avg_rewards: float = return_sums[is_last_step[: num_samples - pad_size]].mean().item()
+        elif fixed_rows:
+            # Fixed-advantage rows carry a placeholder reward; they are not
+            # rollouts and must not dilute the reward the run reports.
+            _keep = torch.ones(return_sums.shape[0], dtype=torch.bool)
+            _keep[[i for i in fixed_rows if i < return_sums.shape[0]]] = False
+            avg_rewards = return_sums[_keep].mean().item() if _keep.any() else 0.0
         else:
             avg_rewards: float = return_sums.mean().item()
 
@@ -1564,6 +1622,32 @@ class RayPPOTrainer:
                 max_seq_len=self.cfg.trainer.algorithm.max_seq_len,
                 prompt_boundaries=mb_prompt_boundaries,
             )
+
+        # ── Fixed-advantage (auxiliary) rows must not dilute ordinary rows ────────
+        # All auxiliary rows land in the LAST mini-batch. Two per-row averages
+        # would otherwise count them as sequences:
+        #   * seq_mean_token_sum_norm divides by the mini-batch's ROW count, so p
+        #     extra rows scale every ordinary token there by B/(B+p);
+        #   * the worker's KL is a mean over rows, so a 1-token penalty row would
+        #     get a whole rollout's KL weight and pin its token to the reference.
+        # Both are corrected per mini-batch so ordinary rows see exactly the
+        # weights they would have without the auxiliary rows, and fixed rows get
+        # a policy-gradient weight equal to one ordinary token and NO KL term.
+        fixed = data.metadata.get("fixed_advantages")
+        if fixed is not None and any(v is not None for v in fixed):
+            lr_mode = self.cfg.trainer.algorithm.loss_reduction
+            # Only seq_mean_token_sum_norm: there every token is divided by the
+            # same (rows x max_seq_len), so after the row-count correction a
+            # fixed row's token weighs exactly one ordinary token. Under
+            # sequence_mean the per-row divisor is the row's own token count, so
+            # a 1-token row would get a WHOLE rollout's weight.
+            assert lr_mode == "seq_mean_token_sum_norm", (
+                f"fixed-advantage rows require loss_reduction=seq_mean_token_sum_norm, got {lr_mode!r}"
+            )
+            normalized_advantages, kl_row_weight = fixed_row_minibatch_corrections(
+                normalized_advantages, fixed, mini_batch_boundaries, data.batch_size
+            )
+            data["kl_row_weight"] = kl_row_weight
 
         data["advantages"] = normalized_advantages
         return data

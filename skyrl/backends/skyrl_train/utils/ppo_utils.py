@@ -1149,6 +1149,87 @@ def reduce_loss(
     return (loss * loss_mask).sum() if loss_mask is not None else loss.sum()
 
 
+def apply_fixed_advantages(
+    advantages: torch.Tensor,
+    returns: torch.Tensor,
+    response_mask: torch.Tensor,
+    fixed: "List[Optional[float]]",
+) -> "Tuple[torch.Tensor, torch.Tensor, List[int]]":
+    """Overwrite the advantage (and return) of rows whose value is fixed.
+
+    ``fixed`` is row-aligned with the UNPADDED batch: ``None`` leaves the
+    estimator's output alone, a float sets every response position of that row
+    to it (masked by ``response_mask``). The batch may be longer than ``fixed``
+    — trailing pad rows are left untouched. Must run BEFORE batch normalisation
+    so a fixed row is rescaled exactly like every other row.
+
+    Why it exists: a row whose advantage is not group-relative (e.g. a penalty
+    row in a uniform auxiliary group) gets exactly 0 from RLOO/GRPO, which
+    would silently delete its gradient.
+
+    Returns (advantages, returns, indices_of_fixed_rows).
+    """
+    assert len(fixed) <= advantages.shape[0], (
+        f"{len(fixed)} fixed-advantage entries for a batch of {advantages.shape[0]} rows"
+    )
+    rows = [i for i, v in enumerate(fixed) if v is not None]
+    if not rows:
+        return advantages, returns, rows
+    advantages = advantages.clone()
+    returns = returns.clone()
+    mask = response_mask.to(advantages.dtype)
+    for i in rows:
+        v = float(fixed[i])  # type: ignore[arg-type]
+        advantages[i] = v * mask[i]
+        returns[i] = v * mask[i]
+    return advantages, returns, rows
+
+
+def fixed_row_minibatch_corrections(
+    normalized_advantages: torch.Tensor,
+    fixed: "List[Optional[float]]",
+    mini_batch_boundaries: "List[Tuple[int, int]]",
+    batch_size: int,
+) -> "Tuple[torch.Tensor, torch.Tensor]":
+    """Undo the dilution fixed-advantage rows cause in their mini-batch.
+
+    Under ``seq_mean_token_sum_norm`` every token of a mini-batch is divided by
+    ``n * max_seq_len``, with ``n`` its ROW count (the caller asserts that mode). Fixed-advantage rows (e.g.
+    one-token penalty rows) are not sequences: with ``n_fixed`` of them the
+    ordinary rows would be scaled by ``(n - n_fixed) / n``. Multiplying the
+    mini-batch by ``n / (n - n_fixed)`` restores the ordinary rows exactly and
+    gives each fixed row the per-token weight of an ordinary token.
+
+    Also returns a per-row KL weight for the worker, whose KL is a mean over the
+    rows of each micro-batch weighted by micro-batch size — i.e. a row mean over
+    the mini-batch. Weight ``n / (n - n_fixed)`` on ordinary rows and ``0`` on
+    fixed rows turns that into the mean over ORDINARY rows only, so a one-token
+    penalty row is not anchored to the reference with a whole rollout's weight.
+    Rows outside any affected mini-batch keep weight 1 (unchanged behaviour).
+    """
+    is_fixed = torch.zeros(batch_size, dtype=torch.bool)
+    for i, v in enumerate(fixed):
+        if v is not None:
+            is_fixed[i] = True
+    out = normalized_advantages.clone()
+    kl_w = torch.ones(batch_size, dtype=torch.float32)
+    for start, end in mini_batch_boundaries:
+        if end <= start:
+            continue
+        n_fix = int(is_fixed[start:end].sum())
+        if n_fix == 0:
+            continue
+        n = end - start
+        n_ord = n - n_fix
+        assert n_ord > 0, f"mini-batch ({start}, {end}) holds only fixed-advantage rows"
+        factor = n / n_ord
+        out[start:end] = out[start:end] * factor
+        w = torch.full((n,), factor, dtype=torch.float32)
+        w[is_fixed[start:end]] = 0.0
+        kl_w[start:end] = w
+    return out, kl_w
+
+
 def apply_loss_reduction_to_advantages_minibatch(
     advantages: torch.Tensor,
     loss_mask: torch.Tensor,
