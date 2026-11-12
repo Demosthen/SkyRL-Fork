@@ -371,6 +371,7 @@ class TinkerEngine:
             .where(
                 (FutureDB.request_type == types.RequestType.OPTIM_STEP)
                 | (FutureDB.request_type == types.RequestType.LOAD_WEIGHTS)
+                | (FutureDB.request_type == types.RequestType.GRAD_STATS)
             )
             .where(FutureDB.status == RequestStatus.PENDING)
             .group_by(FutureDB.model_id)
@@ -615,6 +616,14 @@ class TinkerEngine:
 
         return self.backend.optim_step(model_id, request_data)
 
+    def process_grad_stats(
+        self, model_id: str, request_data: types.GradStatsInput
+    ) -> types.GradStatsOutput | types.ErrorResponse:
+        """Snapshot accumulated gradients or return inner products between snapshots."""
+        if not self.backend.has_model(model_id):
+            return _model_not_found_error(model_id)
+        return self.backend.grad_stats(model_id, request_data)
+
     def process_forward_backward(self, requests: dict[str, tuple[str, types.ForwardBackwardInput]]) -> dict:
         """Run forward and backward pass on a batch of requests."""
         prepared = prepare_model_pass_batch(requests)
@@ -741,6 +750,8 @@ class TinkerEngine:
                 return self.process_load_weights(model_id, types.LoadWeightsInput.model_validate(request_data))
             case types.RequestType.UNLOAD_MODEL:
                 return self.process_unload_model(model_id, types.UnloadModelInput.model_validate(request_data))
+            case types.RequestType.GRAD_STATS:
+                return self.process_grad_stats(model_id, types.GradStatsInput.model_validate(request_data))
             case _:
                 raise ValueError(f"Unknown request type: {request_type}")
 

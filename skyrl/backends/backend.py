@@ -99,6 +99,10 @@ class AbstractBackend(ABC):
         """
         pass
 
+    def grad_stats(self, model_id: str, request_data: types.GradStatsInput) -> types.GradStatsOutput:
+        """Named gradient snapshots and their inner products (optional backend feature)."""
+        raise NotImplementedError(f"{type(self).__name__} does not support grad_stats")
+
     @abstractmethod
     def sample(
         self,

@@ -674,6 +674,13 @@ class OptimStepRequest(BaseModel):
     seq_id: int | None = None
 
 
+class GradStatsRequest(BaseModel):
+    model_id: str
+    op: Literal["save", "gram", "clear"]
+    slot: str | None = None
+    slots: list[str] | None = None
+
+
 class SaveWeightsForSamplerRequest(BaseModel):
     model_id: str
     path: str | None = Field(default=None, pattern=ID_PATTERN, max_length=ID_MAX_LENGTH)
@@ -1125,6 +1132,23 @@ async def optim_step(request: OptimStepRequest, session: AsyncSession = Depends(
 
     await session.commit()
 
+    return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
+
+
+@app.post("/api/v1/grad_stats", response_model=FutureResponse)
+async def grad_stats(request: GradStatsRequest, session: AsyncSession = Depends(get_session)):
+    """Snapshot accumulated gradients into named slots / get their Gram matrix (diagnostics).
+
+    Ordered like optim_step: it applies after all earlier forward_backward requests.
+    """
+    await get_model(session, request.model_id)
+    request_id = await create_future(
+        session=session,
+        request_type=types.RequestType.GRAD_STATS,
+        model_id=request.model_id,
+        request_data=types.GradStatsInput(op=request.op, slot=request.slot, slots=request.slots),
+    )
+    await session.commit()
     return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
 
 

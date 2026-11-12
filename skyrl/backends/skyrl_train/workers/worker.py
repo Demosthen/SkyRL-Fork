@@ -1128,6 +1128,38 @@ class PolicyWorkerBase(Worker):
 
         return status
 
+    def grad_stats(self, op: str, slot: Optional[str] = None, slots: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Named gradient snapshots for gradient diagnostics (FSDP; collective on all ranks).
+
+        - ``"save"``: copy the accumulated gradient into ``slot`` and zero ``.grad``, so the
+          next ``forward_backward`` accumulates from zero. Optimizer state is untouched.
+        - ``"gram"``: return the Gram matrix of inner products between ``slots``.
+        - ``"clear"``: drop all slots and zero ``.grad``.
+        """
+        from skyrl.backends.skyrl_train.utils.grad_stats import gram_matrix, snapshot_grads
+
+        if not hasattr(self, "_grad_slots"):
+            self._grad_slots = {}
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        if op == "save":
+            self._grad_slots[slot] = snapshot_grads(params)
+            for p in params:
+                p.grad = None
+            return {}
+        if op == "gram":
+            missing = [s for s in slots if s not in self._grad_slots]
+            if missing:
+                raise KeyError(f"unknown gradient slots {missing}")
+            gram = gram_matrix([self._grad_slots[s] for s in slots])
+            return {"slots": list(slots), "gram": gram.tolist()}
+        if op == "clear":
+            self._grad_slots = {}
+            for p in params:
+                p.grad = None
+            torch.cuda.empty_cache()
+            return {}
+        raise ValueError(f"unknown grad_stats op {op!r}")
+
     def optim_step(self) -> float:
         """
         Perform optimizer step.

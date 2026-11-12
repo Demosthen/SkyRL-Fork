@@ -425,6 +425,12 @@ class WorkerDispatch:
         self._save_memory_snapshot(model, "optim_step")
         return grad_norms[0]
 
+    def grad_stats(self, model: str, model_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        """Run a gradient-snapshot op (see ``PolicyWorkerBase.grad_stats``) on all workers."""
+        self.ensure_active_adapter(model, model_id)
+        refs = self._actor_groups[model].async_run_ray_method("pass_through", "grad_stats", **kwargs)
+        return ray.get(refs)[0]
+
     def set_lr(self, model: str, learning_rate: float, model_id: Optional[str] = None) -> None:
         """Set learning rate for model's optimizer.
 

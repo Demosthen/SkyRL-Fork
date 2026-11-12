@@ -999,6 +999,20 @@ class SkyRLTrainBackend(AbstractBackend):
         metrics["skyrl.ai/learning_rate"] = adam_params.learning_rate
         return types.OptimStepOutput(metrics=metrics)
 
+    def grad_stats(self, model_id: str, request_data: types.GradStatsInput) -> types.GradStatsOutput:
+        """Gradient snapshots / Gram matrix of snapshots on the policy workers."""
+        role = self._get_role(model_id)
+        if role != "policy" or self._cfg.trainer.strategy != "fsdp":
+            raise NotImplementedError("grad_stats supports FSDP policy models only")
+        if request_data.op == "save" and not request_data.slot:
+            raise ValueError("grad_stats op='save' requires a slot name")
+        if request_data.op == "gram" and not request_data.slots:
+            raise ValueError("grad_stats op='gram' requires slot names")
+        out = self._dispatch.grad_stats(
+            role, model_id=model_id, op=request_data.op, slot=request_data.slot, slots=request_data.slots
+        )
+        return types.GradStatsOutput(**out)
+
     def sample(
         self,
         prepared_batch: types.PreparedSampleBatch,

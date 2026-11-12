@@ -24,6 +24,7 @@ class RequestType(str, Enum):
     LOAD_WEIGHTS = "load_weights"
     SAMPLE = "sample"
     UNLOAD_MODEL = "unload_model"
+    GRAD_STATS = "grad_stats"
 
     # External request that should not be processed by the engine
     EXTERNAL = "external"
@@ -181,6 +182,20 @@ class OptimStepInput(BaseModel):
 
 class OptimStepOutput(BaseModel):
     metrics: dict[str, float] | None = None
+
+
+class GradStatsInput(BaseModel):
+    """Gradient snapshot op: "save" accumulated grads into `slot` (and zero them),
+    "gram" of `slots`, or "clear" all slots."""
+
+    op: Literal["save", "gram", "clear"]
+    slot: str | None = None
+    slots: list[str] | None = None
+
+
+class GradStatsOutput(BaseModel):
+    slots: list[str] | None = None
+    gram: list[list[float]] | None = None
 
 
 class SaveWeightsForSamplerInput(BaseModel):
