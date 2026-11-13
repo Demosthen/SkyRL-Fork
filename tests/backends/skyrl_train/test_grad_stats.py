@@ -51,7 +51,8 @@ def _worker(rank: int, world: int, port: int, result_q):
     vectors = _full_vectors()
     sharded = [[distribute_tensor(t, mesh, [Shard(0)]) for t in v] for v in vectors]
     replicated = [[distribute_tensor(t, mesh, [Replicate()]) for t in v] for v in vectors]
-    result_q.put((rank, gram_matrix(sharded), gram_matrix(replicated)))
+    # numpy, not torch: torch tensors cross a Queue via shared-memory fds that die with this process
+    result_q.put((rank, gram_matrix(sharded).numpy(), gram_matrix(replicated).numpy()))
     dist.destroy_process_group()
 
 
@@ -73,5 +74,5 @@ def test_gram_dtensor_sharded_and_replicated(world):
         p.join(timeout=60)
     expected = _expected(_full_vectors())
     for _, g_sharded, g_replicated in results:
-        torch.testing.assert_close(g_sharded, expected)
-        torch.testing.assert_close(g_replicated, expected)  # replicated dims are not summed
+        torch.testing.assert_close(torch.from_numpy(g_sharded), expected)
+        torch.testing.assert_close(torch.from_numpy(g_replicated), expected)  # replicated dims are not summed

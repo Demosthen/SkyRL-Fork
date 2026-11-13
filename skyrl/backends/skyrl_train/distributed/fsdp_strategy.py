@@ -56,6 +56,15 @@ else:
     CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy = None, None, None
 
 
+def _trainable_subset(model, state_dict: dict) -> dict:
+    """Entries of `state_dict` that belong to parameters with requires_grad=True."""
+    trainable = {name for name, p in model.named_parameters() if p.requires_grad}
+    subset = {k: v for k, v in state_dict.items() if k in trainable}
+    if not subset or len(subset) != len(trainable):
+        raise KeyError(f"state_dict keys do not cover the trainable parameters ({len(subset)} of {len(trainable)})")
+    return subset
+
+
 class FSDPStrategy(DistributedStrategy):
     """
     The strategy for training with FSDP.
@@ -397,6 +406,10 @@ class FSDPStrategy(DistributedStrategy):
                 warnings.simplefilter("ignore")
                 # FSDP2 state_dict returns DTensors directly; no state_dict_type context needed.
                 model_state_dict = save_model.state_dict()
+                if self.is_lora:
+                    # Frozen base weights are reloaded from the base model at init, so a LoRA
+                    # checkpoint only needs the trainable (adapter) tensors.
+                    model_state_dict = _trainable_subset(save_model, model_state_dict)
                 self.print(f"[rank-{rank}]: Saving model to {model_path}")
                 with io.open_file(model_path, "wb") as f:
                     torch.save(model_state_dict, f)
@@ -423,6 +436,7 @@ class FSDPStrategy(DistributedStrategy):
                     "world_size": world_size,
                     "rank": rank,
                     "rng": self.get_rng_state(),  # Add RNG state for reproducibility
+                    "trainable_only": self.is_lora,
                 }
 
                 # Save extra state
@@ -519,7 +533,19 @@ class FSDPStrategy(DistributedStrategy):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             # FSDP2: load_state_dict accepts DTensors directly; no state_dict_type context needed.
-            load_model.load_state_dict(model_state_dict, strict=load_module_strict)
+            if extra_state_dict.get("trainable_only", False):
+                # Adapter-only checkpoint: every trainable tensor must be present; frozen base
+                # weights keep the values loaded from the base model.
+                expected = set(_trainable_subset(load_model, load_model.state_dict()))
+                if set(model_state_dict) != expected:
+                    raise KeyError(
+                        "trainable-only checkpoint does not match the model's trainable "
+                        f"parameters: missing={sorted(expected - set(model_state_dict))[:5]} "
+                        f"unexpected={sorted(set(model_state_dict) - expected)[:5]}"
+                    )
+                load_model.load_state_dict(model_state_dict, strict=False)
+            else:
+                load_model.load_state_dict(model_state_dict, strict=load_module_strict)
             self.print(f"[rank-{rank}]: Successfully loaded model state dict")
 
             # Load optimizer state dict if optimizer object is provided and loading is requested
