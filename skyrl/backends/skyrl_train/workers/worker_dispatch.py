@@ -441,6 +441,12 @@ class WorkerDispatch:
         self.ensure_active_adapter(model, model_id)
         ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "set_lr", learning_rate=learning_rate))
 
+    def set_optimizer_hparams(self, model: str, model_id: Optional[str] = None, **hparams) -> None:
+        """Set optimizer hyperparameters (betas, eps, weight_decay, ...) on all workers."""
+        self._ensure_on_gpu(model, need_optimizer=True, need_model=False)
+        self.ensure_active_adapter(model, model_id)
+        ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "set_optimizer_hparams", **hparams))
+
     def set_algorithm_config(self, model: str, **kwargs) -> None:
         """Update algorithm config fields on all workers for a model."""
         self._ensure_on_gpu(model, need_optimizer=False, need_model=False)

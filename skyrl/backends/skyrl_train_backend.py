@@ -985,10 +985,20 @@ class SkyRLTrainBackend(AbstractBackend):
     def optim_step(self, model_id: str, request_data: types.OptimStepInput) -> types.OptimStepOutput:
         role = self._get_role(model_id)
 
-        # Apply learning rate from AdamParams before optimizer step
-        # Note: beta1, beta2, eps are fixed at optimizer creation and cannot be changed dynamically
+        # Apply the client's AdamParams before the optimizer step. Besides the learning rate,
+        # betas/eps/weight_decay are set on the torch param groups each step (FSDP), so they
+        # follow the client (Tinker semantics) and override values restored from a checkpoint's
+        # optimizer state. Megatron keeps its config values.
         adam_params = request_data.adam_params
         self._dispatch.set_lr(role, adam_params.learning_rate, model_id=model_id)
+        if self._cfg.trainer.strategy == "fsdp":
+            self._dispatch.set_optimizer_hparams(
+                role,
+                model_id=model_id,
+                betas=(adam_params.beta1, adam_params.beta2),
+                eps=adam_params.eps,
+                weight_decay=adam_params.weight_decay,
+            )
 
         grad_norm = self._dispatch.optim_step(role, model_id=model_id)
         logger.info(f"optim_step: lr={adam_params.learning_rate}, grad_norm={grad_norm}")

@@ -586,6 +586,21 @@ class Worker(DistributedTorchRayActor):
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = learning_rate
 
+    def set_optimizer_hparams(self, **hparams) -> None:
+        """
+        Set optimizer hyperparameters (e.g. ``betas``, ``eps``, ``weight_decay``) on every
+        param group, like ``set_lr``. Tinker clients send these with each optim_step; they also
+        replace values restored by ``optimizer.load_state_dict`` from a checkpoint. No-op
+        without an optimizer.
+        """
+        if self.optimizer is None:
+            return
+        for param_group in self.optimizer.param_groups:
+            for key, value in hparams.items():
+                if key not in param_group:
+                    raise KeyError(f"optimizer param group has no hyperparameter {key!r}")
+                param_group[key] = value
+
 
 # adapted from OpenReasonerZero: https://github.com/Open-Reasoner-Zero/Open-Reasoner-Zero/blob/main/orz/ppo/actors.py
 class PPORayActorGroup:
